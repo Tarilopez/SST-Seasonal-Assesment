@@ -1,0 +1,405 @@
+---
+title: "Coral reef thermal seasonality: regional pooling, breakpoint model, and Figure 2"
+author: "SST seasonality metrics project"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                       fig.width = 8, fig.height = 6)
+```
+
+## Scope of this notebook
+
+This notebook reproduces, in R, the statistical modeling and figure-building
+steps behind Figure 2: regional random-effects pooling across 81 reef sites,
+a validated breakpoint (threshold) model, the derived comparison between
+phase-shift magnitude and timing precision, and the assembled 6-panel figure.
+
+**It intentionally does not re-derive the underlying per-site metrics from
+raw sea-surface-temperature (SST) data.** Those per-site numbers (seasonal
+mean/amplitude trends, phase-shift-over-time, phase circular SD, cue
+reliability rho) come from harmonic regression and circular-statistics
+methods already implemented, tested, and validated in this project's
+Python pipeline. Re-implementing harmonic fitting and bootstrap trend
+testing a second time in R would duplicate that work and risks introducing
+silent numerical drift between two independent implementations without
+adding scientific value. Instead, this notebook takes the per-site outputs
+of that pipeline as its documented starting point (see `data/README` /
+the Data section below for exactly which upstream tables each input file
+was exported from) and performs, natively in R, every step from there
+onward: pooling, breakpoint estimation, and figure construction.
+
+Every new R routine used here (`dersimonian_laird()`, `grid_search_breakpoint()`)
+is a line-for-line port of the corresponding validated Python function, and
+the pooled M-trend estimate below is cross-checked against the
+already-published Python result before anything is built on top of it.
+
+## Setup
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(patchwork)
+  library(ggrepel)
+  library(scales)
+})
+
+source("R/pooling.R")
+source("R/breakpoint.R")
+
+MIN_PT <- 8
+theme_set(
+  theme_bw(base_size = MIN_PT) +
+    theme(
+      panel.grid = element_blank(),
+      axis.text = element_text(size = MIN_PT, colour = "black"),
+      axis.title = element_text(size = MIN_PT, colour = "black"),
+      plot.title = element_blank()
+    )
+)
+
+BLUE <- "#0072B2"
+GREEN <- "#009E73"
+ORANGE <- "#D55E00"
+
+REGION_LABELS <- c(
+  Western_Atlantic_Caribbean_Brazil = "Western Atlantic & Caribbean",
+  Red_Sea_Persian_Gulf = "Red Sea & Persian Gulf",
+  Coral_Triangle_SE_Asia = "Coral Triangle & SE Asia",
+  South_Central_Pacific_Polynesia = "South Central Pacific",
+  Eastern_Atlantic_West_Africa = "Eastern Atlantic & West Africa",
+  Western_Central_Pacific = "Western & Central Pacific",
+  Central_Indian_Ocean = "Central Indian Ocean",
+  Western_Indian_Ocean = "Western Indian Ocean",
+  Australia = "Australia",
+  Eastern_Pacific = "Eastern Pacific",
+  ORIGINAL_9 = "Focal subset"
+)
+```
+
+## Data
+
+All input tables live under `data/`. Each is a per-site (or per-site-daily)
+extract of an already-validated Python output table:
+
+| File | Rows | Columns | Source (upstream Python table) |
+|---|---|---|---|
+| `site_trends_M_A1.csv` | 162 (81 sites x 2 axes) | `site_id, region, axis, slope, slope_ci_lo, slope_ci_hi` | `extension/axes81/tables/axes81_1b_trends.csv`, filtered to `period=="full"`, `axis` in `{M, A1}` |
+| `site_phase_shift.csv` | 81 | `site_id, region, shift_days, shift_ci_lo, shift_ci_hi` | `extension/axes81/tables/axes81_1b_phase_block_shift.csv`, `period=="full"` |
+| `site_phase_sd_A1.csv` | 81 | `site_id, region, pixel_lat, pixel_lon, phase_sd_days, phase_R, mean_A1` | `extension/axes81/tables/axes81_2d_phase_sd_distribution.csv` |
+| `site_rho.csv` | 81 | `site_id, region, rho_magnitude, rho_magnitude_ci_lo, rho_magnitude_ci_hi` | `extension/tables/taskE3_site_metrics.csv` |
+| `inset_climatology/*_daily.csv` | 16071 each | `site_id, date, sst` | `extension/data/oisst_site_daily_full/*.csv`, 2 representative sites only |
+
+```{r load-data}
+trends <- read.csv("data/site_trends_M_A1.csv", stringsAsFactors = FALSE)
+shift <- read.csv("data/site_phase_shift.csv", stringsAsFactors = FALSE)
+phase_sd <- read.csv("data/site_phase_sd_A1.csv", stringsAsFactors = FALSE)
+rho <- read.csv("data/site_rho.csv", stringsAsFactors = FALSE)
+
+prep <- function(df, effect_col, lo_col, hi_col) {
+  out <- df[, c("site_id", "region", effect_col, lo_col, hi_col)]
+  names(out) <- c("site_id", "region", "effect", "ci_lo", "ci_hi")
+  out
+}
+
+m_site <- prep(trends[trends$axis == "M", ], "slope", "slope_ci_lo", "slope_ci_hi")
+a1_site <- prep(trends[trends$axis == "A1", ], "slope", "slope_ci_lo", "slope_ci_hi")
+shift_site <- prep(shift, "shift_days", "shift_ci_lo", "shift_ci_hi")
+rho_site <- prep(rho, "rho_magnitude", "rho_magnitude_ci_lo", "rho_magnitude_ci_hi")
+```
+
+## Step 1: Regional pooling (DerSimonian-Laird)
+
+`pooling.R` implements `dersimonian_laird()`, a direct port of the Python
+random-effects meta-analysis routine used throughout this project
+(including the standard truncation of a negative moment-estimator tau^2 to
+zero; Borenstein et al. 2009, also R's `metafor` default), plus
+`ci_to_var()` (the Wald-type CI-to-variance conversion used wherever a
+bootstrap CI, rather than a parametric SE, needs to feed a
+variance-weighted pooling step) and `pool_by_region()`, which pools both
+overall and within each region (falling back to an unweighted mean with no
+CI for any region with fewer than 3 sites, e.g. Eastern_Pacific, rather
+than silently dropping or crashing on it).
+
+**Before trusting this port**, we check it against a number already
+published from the Python pipeline: the all-site pooled M (seasonal mean)
+trend across 81 sites, which the Python analysis reported as
+`0.02222 [0.02075, 0.02369] degC/yr`.
+
+```{r pool-check}
+pool_M <- pool_by_region(m_site)
+cat(sprintf("R:      %.5f [%.5f, %.5f]\n",
+            pool_M$overall$pooled, pool_M$overall$ci_lo, pool_M$overall$ci_hi))
+cat(sprintf("Python: %.5f [%.5f, %.5f]  (expected)\n", 0.02222, 0.02075, 0.02369))
+stopifnot(abs(pool_M$overall$pooled - 0.02222) < 1e-4)
+```
+
+The match confirms `dersimonian_laird()` is a correct port. We now pool the
+remaining three axes the same way.
+
+```{r pool-all}
+pool_A1 <- pool_by_region(a1_site)
+pool_shift <- pool_by_region(shift_site)
+pool_rho <- pool_by_region(rho_site)
+
+pooled_summary <- tibble::tibble(
+  axis = c("M trend (degC/yr)", "A1 trend, naive (degC/yr)", "phase shift (days)", "cue reliability rho"),
+  pooled = c(pool_M$overall$pooled, pool_A1$overall$pooled, pool_shift$overall$pooled, pool_rho$overall$pooled),
+  ci_lo = c(pool_M$overall$ci_lo, pool_A1$overall$ci_lo, pool_shift$overall$ci_lo, pool_rho$overall$ci_lo),
+  ci_hi = c(pool_M$overall$ci_hi, pool_A1$overall$ci_hi, pool_shift$overall$ci_hi, pool_rho$overall$ci_hi)
+)
+knitr::kable(pooled_summary, digits = 5)
+```
+
+Row order for the forest-plot panels (A-C) follows panel A's (M trend)
+pooled regional estimate, descending, with `Eastern_Pacific` excluded (n=2,
+below the minimum for DerSimonian-Laird pooling; it is retained in panel F,
+where Check 1's rho estimator provides a valid CI even at n=2).
+
+```{r region-order}
+order_ABC <- pool_M$by_region %>%
+  filter(region != "Eastern_Pacific") %>%
+  arrange(desc(pooled)) %>%
+  pull(region)
+```
+
+## Step 2: Breakpoint model, validated before use
+
+`breakpoint.R` implements a grid-search continuous piecewise-linear
+("hinge") estimator: `y = b0 + b1*x + b2*max(x - bp, 0)`, with the
+breakpoint chosen by minimizing residual sum of squares over a grid
+spanning the 5th-95th percentile of x, and a case-resampling bootstrap CI.
+
+Per this project's standing rule, **any new estimator must be validated
+against synthetic data with a known answer before being trusted on real
+data.** `validate_breakpoint_method()` simulates n=81 points with a known
+breakpoint at A1=2.0 and checks that the method recovers it.
+
+```{r validate-breakpoint}
+bp_validation <- validate_breakpoint_method()
+stopifnot("breakpoint method failed synthetic validation" = bp_validation$passed)
+```
+
+With validation passed, we fit the breakpoint model to the real data:
+circular SD of phase timing (`phase_sd_days`) as a function of seasonal
+amplitude (`mean_A1`), across all 81 sites.
+
+```{r fit-breakpoint}
+bp_fit <- grid_search_breakpoint(phase_sd$mean_A1, phase_sd$phase_sd_days)
+bp_ci <- bootstrap_breakpoint_ci(phase_sd$mean_A1, phase_sd$phase_sd_days, n_boot = 2000)
+
+cat(sprintf("Breakpoint: %.3f degC, 95%% CI [%.3f, %.3f]\n", bp_fit$breakpoint, bp_ci$ci_lo, bp_ci$ci_hi))
+cat(sprintf("Slope before: %.3f | Slope after: %.3f\n", bp_fit$coef[2], bp_fit$coef[2] + bp_fit$coef[3]))
+```
+
+The point estimate and slopes are deterministic (no randomness in the grid
+search), so they match the Python-derived values (`1.126`, `-39.663`,
+`-1.334`) almost exactly; the bootstrap CI is close to, but not bit-
+identical to, Python's `[0.974, 1.233]`, because R's `sample.int()` and
+numpy's `default_rng` are different RNG algorithms even under a nominally
+matching seed.
+
+Sites with unreliable phase estimates (circular concentration `phase_R <
+0.8`) are flagged for display as open markers rather than excluded:
+
+```{r flag-unstable}
+phase_sd <- phase_sd %>% mutate(unstable = phase_R < 0.8)
+n_unstable <- sum(phase_sd$unstable)
+n_unstable
+```
+
+## Step 3: Panel E — regional phase shift vs. timing envelope
+
+Panel E asks whether the observed regional phase shift (change in peak
+timing between the first and last 15 years) is small relative to each
+region's baseline timing envelope (its median day-to-day phase circular
+SD). For each region we compute the median envelope from `phase_sd`, join
+it to the pooled phase-shift estimate, and flag regions whose pooled CI
+excludes zero (i.e., a statistically resolvable shift).
+
+```{r panel-e-derive}
+envelope <- phase_sd %>% group_by(region) %>% summarise(median_envelope = median(phase_sd_days), .groups = "drop")
+
+SHORT_REGION_LABELS <- c(
+  Western_Atlantic_Caribbean_Brazil = "W Atlantic/Caribbean",
+  Coral_Triangle_SE_Asia = "Coral Triangle",
+  Eastern_Atlantic_West_Africa = "E Atlantic/W Africa",
+  Western_Indian_Ocean = "W Indian Ocean"
+)
+
+panelE_df <- pool_shift$by_region %>%
+  left_join(envelope, by = "region") %>%
+  mutate(abs_shift = abs(pooled),
+         excl_zero = !is.na(ci_lo) & ((ci_lo > 0) | (ci_hi < 0)),
+         ratio = abs_shift / median_envelope,
+         region_label = ifelse(region %in% names(SHORT_REGION_LABELS),
+                                SHORT_REGION_LABELS[region], REGION_LABELS[region]))
+
+panelE_df %>% filter(excl_zero) %>% arrange(desc(ratio)) %>%
+  transmute(region, abs_shift = round(abs_shift, 3), median_envelope = round(median_envelope, 3),
+            ratio = round(ratio, 3)) %>%
+  knitr::kable()
+
+cat("All regions fall below the 1:1 line (shift < envelope):",
+    all(panelE_df$abs_shift < panelE_df$median_envelope), "\n")
+```
+
+## Step 4: Assemble Figure 2
+
+```{r build-panels-abc, fig.show='hide'}
+make_forest_panel <- function(region_df, overall, order, mult = 1, xlab, letter) {
+  df <- region_df %>%
+    filter(region %in% order) %>%
+    mutate(region_label = REGION_LABELS[region],
+           region_f = factor(region, levels = rev(order)),
+           pooled = pooled * mult, ci_lo = ci_lo * mult, ci_hi = ci_hi * mult)
+  band <- data.frame(ci_lo = overall$ci_lo * mult, ci_hi = overall$ci_hi * mult)
+
+  ggplot(df, aes(y = region_f, x = pooled)) +
+    geom_rect(data = band, inherit.aes = FALSE,
+              aes(xmin = ci_lo, xmax = ci_hi, ymin = -Inf, ymax = Inf),
+              fill = "grey70", alpha = 0.3) +
+    geom_vline(xintercept = overall$pooled * mult, colour = "black", linewidth = 0.4) +
+    geom_vline(xintercept = 0, colour = "black", linewidth = 0.55, linetype = "dotted") +
+    geom_errorbar(aes(xmin = ci_lo, xmax = ci_hi), width = 0, orientation = "y", colour = BLUE, linewidth = 0.45) +
+    geom_point(colour = BLUE, size = 1.6) +
+    scale_y_discrete(labels = function(r) REGION_LABELS[r]) +
+    labs(x = xlab, y = NULL, tag = letter) +
+    theme(plot.tag = element_text(size = 10, face = "bold"),
+          plot.tag.position = c(0.02, 0.98))
+}
+
+panel_A <- make_forest_panel(pool_M$by_region, pool_M$overall, order_ABC, mult = 10,
+                              xlab = expression("M trend (" * degree * C ~ decade^{-1} * ")"), letter = "A")
+panel_B <- make_forest_panel(pool_A1$by_region, pool_A1$overall, order_ABC, mult = 10,
+                              xlab = expression("A1 trend, naive (" * degree * C ~ decade^{-1} * ")"), letter = "B") +
+  theme(axis.text.y = element_blank())
+panel_C <- make_forest_panel(pool_shift$by_region, pool_shift$overall, order_ABC, mult = 1,
+                              xlab = "phase shift, first vs\nlast 15 yr (days)", letter = "C") +
+  theme(axis.text.y = element_blank())
+```
+
+```{r build-panel-d, fig.show='hide'}
+INSET_BELOW <- "South_Central_Pacific_Polynesia_03"
+INSET_ABOVE <- "Western_Indian_Ocean_01"
+inset_meta <- phase_sd %>% filter(site_id %in% c(INSET_BELOW, INSET_ABOVE))
+
+load_climatology <- function(site_id) {
+  daily <- read.csv(file.path("data", "inset_climatology", paste0(site_id, "_daily.csv")), stringsAsFactors = FALSE)
+  daily$date <- as.Date(daily$date)
+  daily$doy <- as.numeric(format(daily$date, "%j"))
+  daily %>% group_by(doy) %>% summarise(sst = mean(sst, na.rm = TRUE), .groups = "drop")
+}
+clim_below <- load_climatology(INSET_BELOW) %>% mutate(site_id = INSET_BELOW)
+clim_above <- load_climatology(INSET_ABOVE) %>% mutate(site_id = INSET_ABOVE)
+clim_all <- bind_rows(clim_below, clim_above)
+
+a1_below <- round(inset_meta$mean_A1[inset_meta$site_id == INSET_BELOW], 2)
+a1_above <- round(inset_meta$mean_A1[inset_meta$site_id == INSET_ABOVE], 2)
+
+inset_plot <- ggplot(clim_all, aes(doy, sst, colour = site_id)) +
+  geom_line(linewidth = 0.5) +
+  scale_colour_manual(values = c(setNames(ORANGE, INSET_BELOW), setNames(BLUE, INSET_ABOVE)), guide = "none") +
+  annotate("text", x = 15, y = max(clim_below$sst), label = paste0("A1=", a1_below),
+           colour = ORANGE, hjust = 0, vjust = 0, fontface = "bold", size = (MIN_PT - 2.5) / .pt) +
+  annotate("text", x = 350, y = min(clim_above$sst), label = paste0("A1=", a1_above),
+           colour = BLUE, hjust = 1, vjust = 1, fontface = "bold", size = (MIN_PT - 2.5) / .pt) +
+  scale_x_continuous(breaks = c(1, 182, 365), labels = c("Jan", "Jul", "Dec")) +
+  scale_y_continuous(expand = expansion(mult = c(0.18, 0.18))) +
+  labs(x = NULL, y = NULL) +
+  theme_bw(base_size = MIN_PT - 2) +
+  theme(panel.grid = element_blank(), plot.background = element_rect(colour = "black", linewidth = 0.4),
+        plot.margin = margin(2, 2, 2, 2))
+
+hinge_curve <- data.frame(x = exp(seq(log(min(phase_sd$mean_A1)), log(max(phase_sd$mean_A1)), length.out = 400))) %>%
+  mutate(y = bp_fit$coef[1] + bp_fit$coef[2] * x + bp_fit$coef[3] * pmax(x - bp_fit$breakpoint, 0))
+
+panel_D_main <- ggplot(phase_sd, aes(mean_A1, phase_sd_days)) +
+  annotate("rect", xmin = bp_ci$ci_lo, xmax = bp_ci$ci_hi, ymin = -Inf, ymax = Inf, fill = "grey70", alpha = 0.3) +
+  geom_vline(xintercept = bp_fit$breakpoint, linetype = "dashed", colour = "grey40") +
+  geom_line(data = hinge_curve, aes(x, y), inherit.aes = FALSE, linewidth = 0.6) +
+  geom_point(data = filter(phase_sd, !unstable), colour = BLUE, size = 1.3) +
+  geom_point(data = filter(phase_sd, unstable), shape = 21, colour = BLUE, fill = NA, size = 2, stroke = 0.9) +
+  annotate("text", x = min(phase_sd$mean_A1) * 1.05, y = 8, hjust = 0, vjust = 1, size = MIN_PT / .pt,
+           label = sprintf("breakpoint %.2f\n[%.2f,%.2f] degC", bp_fit$breakpoint, bp_ci$ci_lo, bp_ci$ci_hi)) +
+  scale_x_log10(breaks = c(0.3, 0.5, 1, 2, 5), labels = scales::label_number(drop0trailing = TRUE)) +
+  labs(x = "A1 (degC)", y = "phase circular SD (days)", tag = "D") +
+  theme(plot.tag = element_text(size = 10, face = "bold"), plot.tag.position = c(0.02, 0.98),
+        plot.margin = margin(t = 5.5, r = 5.5, b = 16, l = 5.5))
+
+panel_D <- panel_D_main +
+  inset_element(inset_plot, left = 0.35, bottom = 0.42, right = 0.98, top = 0.98) +
+  plot_annotation(caption = sprintf("open markers: R<0.8, n=%d", n_unstable)) &
+  theme(plot.caption = element_text(size = MIN_PT, hjust = 0, face = "italic"))
+```
+
+```{r build-panel-e, fig.show='hide'}
+xmax_e <- max(panelE_df$median_envelope) * 1.25
+ymax_e <- max(panelE_df$abs_shift) * 1.25
+
+panel_E <- ggplot(panelE_df, aes(median_envelope, abs_shift)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  geom_point(data = filter(panelE_df, !excl_zero), colour = "grey60", size = 1.1) +
+  geom_point(data = filter(panelE_df, excl_zero), colour = "black", size = 2) +
+  geom_text_repel(data = filter(panelE_df, excl_zero),
+                   aes(label = paste0(region_label, "\nratio=", round(ratio, 2))),
+                   size = (MIN_PT - 1) / .pt, segment.size = 0.3, min.segment.length = 0, seed = 1,
+                   box.padding = 0.4, force = 3, max.overlaps = Inf,
+                   xlim = c(0, xmax_e), ylim = c(0, ymax_e)) +
+  coord_cartesian(xlim = c(0, xmax_e), ylim = c(0, ymax_e)) +
+  labs(x = "median timing envelope (days)", y = "abs regional phase shift (days)", tag = "E") +
+  theme(plot.tag = element_text(size = 10, face = "bold"), plot.tag.position = c(0.02, 0.98))
+```
+
+```{r build-panel-f, fig.show='hide'}
+order_F <- pool_rho$by_region %>% arrange(desc(pooled)) %>% pull(region)
+
+panel_F <- pool_rho$by_region %>%
+  mutate(region_f = factor(region, levels = rev(order_F))) %>%
+  ggplot(aes(y = region_f, x = pooled)) +
+  annotate("rect", xmin = pool_rho$overall$ci_lo, xmax = pool_rho$overall$ci_hi,
+           ymin = -Inf, ymax = Inf, fill = "grey70", alpha = 0.3) +
+  geom_vline(xintercept = pool_rho$overall$pooled, colour = "black", linewidth = 0.4) +
+  geom_vline(xintercept = 0, colour = "grey50", linetype = "dashed", linewidth = 0.4) +
+  geom_errorbar(aes(xmin = ci_lo, xmax = ci_hi), width = 0, orientation = "y", colour = GREEN, linewidth = 0.45) +
+  geom_point(colour = GREEN, size = 1.6) +
+  scale_y_discrete(labels = function(r) REGION_LABELS[r]) +
+  # rho -> r^2 is only monotonic for rho >= 0; a few small-sample Wald CIs
+  # dip slightly below zero, so the primary axis spans negative values
+  # even though rho itself cannot be. sign(rho)*rho^2*100 is strictly
+  # monotonic everywhere and equals rho^2*100 wherever it matters (rho>=0,
+  # the only region break labels are ever placed).
+  scale_x_continuous(
+    sec.axis = sec_axis(~ sign(.) * (.)^2 * 100, name = "r^2 (%)", breaks = c(0, 10, 20))
+  ) +
+  labs(x = "cue reliability, rho", y = NULL, tag = "F") +
+  theme(plot.tag = element_text(size = 10, face = "bold"), plot.tag.position = c(0.02, 0.98))
+```
+
+```{r assemble-figure, fig.width=169/25.4, fig.height=225/25.4}
+top_row <- panel_A + panel_B + panel_C + plot_layout(widths = c(1, 1, 1))
+bottom_row <- panel_D + panel_E + panel_F + plot_layout(widths = c(1, 1, 1))
+figure2 <- top_row / bottom_row + plot_layout(heights = c(0.85, 1.15))
+figure2
+```
+
+```{r save-figure}
+dir.create("figures", showWarnings = FALSE)
+ggsave("figures/figure2.pdf", figure2, width = 169, height = 225, units = "mm", device = cairo_pdf)
+ggsave("figures/figure2_600dpi.png", figure2, width = 169, height = 225, units = "mm", dpi = 600)
+```
+
+## Session info
+
+```{r session-info}
+sessionInfo()
+```
