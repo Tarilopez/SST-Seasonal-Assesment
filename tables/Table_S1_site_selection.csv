@@ -1,0 +1,12 @@
+"region","raw_candidates","after_100km_declustering","accepted","rejected_landmask"
+"Australia",1655,54,8,0
+"Central Indian Ocean",6496,55,8,0
+"Coral Triangle and SE Asia",4451,295,8,1
+"Eastern Atlantic and West Africa",13,7,6,1
+"Eastern Pacific",8,2,2,0
+"Red Sea and Persian Gulf",857,52,8,0
+"South Central Pacific and Polynesia",334,60,8,0
+"Western Atlantic, Caribbean and Brazil",917,108,8,0
+"Western Central Pacific",1367,95,8,0
+"Western Indian Ocean",1370,87,8,0
+"Focal subset (retained, not re-selected)",,,9,

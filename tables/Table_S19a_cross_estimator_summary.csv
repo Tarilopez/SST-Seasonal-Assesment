@@ -1,0 +1,4 @@
+"quantity","median","iqr_lo","iqr_hi","min","max"
+"Empirical-peak consistency, all 81 sites",0.906281934946331,0.822500341290542,0.949220957855626,0.28006799264619,0.989873859628075
+"Below the amplitude breakpoint",0.803682703448145,,,,
+"Above the amplitude breakpoint",0.919105593296877,,,,
